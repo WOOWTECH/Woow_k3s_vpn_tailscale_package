@@ -1,0 +1,80 @@
+{{- $web := .Values.tailscale.webListen -}}
+{{/*
+nginx entrance: the single port the platform tunnels to. Everything behind basic
+auth (the platform password) → `tailscale web` on {{ $web }} (read-only mode, which
+still has Log in / re-authenticate). `tailscale web` has NO authentication of its
+own on Linux and can re-point the node at another control server, so nothing may
+reach it except through here.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tailscale.entranceConfigMapName" . }}
+  labels:
+    {{- include "tailscale.labels" . | nindent 4 }}
+data:
+  # Mounted over /etc/nginx/nginx.conf: pinned workers, pid / temp paths under /tmp
+  # (read-only root filesystem; the pod runs as uid 1000, not the image's 101).
+  nginx.conf: |
+    worker_processes {{ .Values.entrance.workerProcesses }};
+    error_log  /dev/stderr notice;
+    pid        /tmp/nginx.pid;
+
+    events {
+      worker_connections {{ .Values.entrance.workerConnections }};
+    }
+
+    http {
+      proxy_temp_path /tmp/proxy_temp;
+      client_body_temp_path /tmp/client_temp;
+      fastcgi_temp_path /tmp/fastcgi_temp;
+      uwsgi_temp_path /tmp/uwsgi_temp;
+      scgi_temp_path /tmp/scgi_temp;
+
+      include       /etc/nginx/mime.types;
+      default_type  application/octet-stream;
+      log_format    woow '$remote_addr $remote_user "$request" $status $body_bytes_sent';
+      access_log    /dev/stdout woow;
+      sendfile      on;
+      keepalive_timeout 65;
+      server_tokens off;
+      client_max_body_size 1m;
+
+      server {
+        listen {{ .Values.entrance.port }};
+        server_name _;
+
+        # Loopback peers are refused outright. In userspace mode tailscaled hands a
+        # tailnet connection to an unserved port of the node to 127.0.0.1:<port>, so
+        # without this every device on the tenant's tailnet could reach (and try
+        # passwords on) this entrance at <node>:{{ .Values.entrance.port }}. The platform tunnel,
+        # same-workspace pods and kubelet probes all arrive on the pod IP.
+        deny 127.0.0.0/8;
+        deny ::1;
+        allow all;
+
+        # nginx-local liveness / readiness (the node's own health is the tailscale
+        # container's probe).
+        location = /healthz {
+          access_log off;
+          default_type text/plain;
+          return 200 "ok\n";
+        }
+
+        location / {
+          auth_basic           "woow-tailscale";
+          auth_basic_user_file /etc/nginx/auth/.htpasswd;
+          proxy_pass http://{{ $web }};
+          proxy_http_version 1.1;
+          # Host is kept so the web client's CSRF check (Origin vs Host, when the
+          # browser sends no Sec-Fetch-Site) matches the public origin.
+          proxy_set_header Host $http_host;
+          # The tenant's basic-auth credentials never travel further.
+          proxy_set_header Authorization "";
+          proxy_set_header X-Forwarded-Proto $scheme;
+          # /api/up waits for the login URL (or for Running after a re-auth).
+          proxy_read_timeout 120s;
+          add_header Cache-Control "no-store" always;
+        }
+      }
+    }

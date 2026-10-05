@@ -1,0 +1,53 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tailscale.fullname" . }}-default-deny
+  labels:
+    {{- include "tailscale.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tailscale.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tailscale.fullname" . }}-allow
+  labels:
+    {{- include "tailscale.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tailscale.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  # No chart ingress rule: the platform baseline admits the tunnel (cloudflared)
+  # and the workspace's own pods. Peers' WireGuard replies arrive as established
+  # flows of the node's own outbound traffic.
+  ingress: []
+  # THE guard on what the tailnet can reach through this node: everything the node
+  # forwards originates from this pod.
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # This workspace: serve-forward targets and a same-workspace Headscale.
+    - to:
+        - podSelector: {}
+    # The public internet, any port / protocol: control plane and DERP (TCP 443),
+    # STUN (UDP 3478), peers' WireGuard endpoints (any UDP port), a Headscale on any
+    # port. Private, link-local and CGNAT ranges stay blocked — the cluster (pods
+    # 10.42/16, Services 10.43/16; kube-router evaluates after DNAT), the node LAN and
+    # apiserver (192.168.10.x), and the nodes' own tailnet (100.64/10).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+{{- end }}

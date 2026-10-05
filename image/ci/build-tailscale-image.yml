@@ -1,0 +1,279 @@
+name: Build and Push tailscale Image
+# tailscale cloud-service image ——「VPN 節點（相容 Tailscale）」（woow-paas-charts charts/tailscale）。
+# 衍生自 WOOWTECH/Woow_podman_vpn_tailscale_package @ 4d4a735 的 Containerfile＋entrypoint.sh
+# （只做 k3s；podman repo 與 HA add-on 不動）。base 是 Docker Hub 官方 tailscale/tailscale，
+# 以 index digest 釘死（tailscale/Dockerfile 的 ARG BASE）；本 image 疊的東西見 tailscale/README.md：
+#   1. bash／jq／tini＋entrypoint（podman 流程不變；k8s 模式：userspace、state 在 PVC、
+#      exit node／app connector／subnet route／SSH 強制關、authkey 只在需要登入時用、
+#      serve 清單執行時驗證只收同 namespace 的 Service、web UI read-only 綁 127.0.0.2）
+#   2. USER 1000（podman 版是 root）
+# 流程同 build-pi-agent-image.yml：build → 成品複驗（含 entrypoint 單元測試、非 root 起
+# tailscaled、強制關閉項實測）→ 推候選 tag `<tag>-pending-approval` → 開 prod approval issue →
+# 核可留言 promote 成正式 tag。刻意不推 :latest（平台一律 pin digest）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag — UTC timestamp format YYYYMMDD.HHMM (e.g. 20260727.1400)"
+        required: true
+  push:
+    tags:
+      - "tailscale-v*"
+  issue_comment:
+    types: [created]
+
+env:
+  # Push 用內部 Service URL（繞過 Traefik / Cloudflare，與其他 build 線一致）
+  JCR_INTERNAL: artifactory-jcr-artifactory-nginx.jfrog.svc.cluster.local
+  IMAGE_NAME: woow-paas-docker-local/tailscale
+  WORKFLOW_MARKER: build-tailscale-image.yml
+  # 上游版本（Dockerfile ARG BASE 的 tag 必須與此一致；verify 也比對 `tailscale version`）
+  TAILSCALE_VERSION: "1.102.5"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request == null &&
+       startsWith(github.event.issue.title, '[prod-approval:build-tailscale-image.yml]'))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: resolve-tag
+        if: github.event_name != 'issue_comment'
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            TAG="${TAG#tailscale-v}"
+          fi
+          echo "IMAGE_TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "CANDIDATE_TAG=${TAG}-pending-approval" >> "$GITHUB_ENV"
+
+      # Login 在 build 之前（下一步的 dest tag 占用檢查要認證）；gate 前只推候選 tag。
+      - name: Login to JCR (internal)
+        if: github.event_name != 'issue_comment'
+        run: |
+          echo "${{ secrets.JCR_PASSWORD }}" | \
+            docker login "${JCR_INTERNAL}" \
+              -u "${{ secrets.JCR_USERNAME }}" --password-stdin
+
+      # ── Preflight：正式 tag 不可被覆蓋（平台 pin digest，覆蓋＝換掉租戶在跑的東西）──
+      - name: Preflight — 檢查 dest tag 是否已被占用
+        if: github.event_name != 'issue_comment'
+        run: |
+          set -euo pipefail
+          DEST_REF="${JCR_INTERNAL}/${IMAGE_NAME}:${IMAGE_TAG}"
+          if docker manifest inspect --insecure "${DEST_REF}" >/tmp/dest-existing.out 2>/tmp/dest-existing.err; then
+            echo "::error::${IMAGE_NAME}:${IMAGE_TAG} 已存在，拒絕覆蓋 prod tag。請換一個時間戳。"
+            exit 1
+          elif grep -qiE 'no such manifest|manifest unknown|not found|404' /tmp/dest-existing.err; then
+            echo "dest tag 尚未存在，可安全建置"
+          else
+            echo "::error::讀取 ${DEST_REF} 失敗（非 not-found），憑證或網路問題："
+            cat /tmp/dest-existing.err
+            exit 1
+          fi
+
+      # ── Build：放在 approval gate 之前，注定失敗的 build 不必讓核可者空等 ──
+      - name: Build image
+        if: github.event_name != 'issue_comment'
+        run: |
+          set -euo pipefail
+          BASE_LINE=$(grep -E '^ARG BASE=' tailscale/Dockerfile)
+          echo "${BASE_LINE}"
+          echo "${BASE_LINE}" | grep -qE "^ARG BASE=docker\.io/tailscale/tailscale:v${TAILSCALE_VERSION//./\\.}@sha256:[0-9a-f]{64}$" \
+            || { echo "::error::tailscale/Dockerfile 的 ARG BASE 必須是 tailscale/tailscale:v${TAILSCALE_VERSION}@sha256:<digest>（tag 與 digest 一起釘）"; exit 1; }
+          docker build --pull \
+            -f tailscale/Dockerfile \
+            -t "${JCR_INTERNAL}/${IMAGE_NAME}:${CANDIDATE_TAG}" \
+            tailscale
+
+      - name: Verify built image
+        if: github.event_name != 'issue_comment'
+        run: |
+          set -euo pipefail
+          IMG="${JCR_INTERNAL}/${IMAGE_NAME}:${CANDIDATE_TAG}"
+          C=ts-verify
+          fail() { docker logs "$C" 2>&1 | tail -40 || true; docker rm -f "$C" >/dev/null 2>&1 || true; docker volume rm -f ts-verify-state >/dev/null 2>&1 || true; echo "::error::$1"; exit 1; }
+          ARCH=$(docker image inspect "$IMG" --format '{{.Architecture}}/{{.Os}}'); echo "architecture = ${ARCH}"
+          [ "$ARCH" = "amd64/linux" ] || fail "image 架構為 ${ARCH}，預期 amd64/linux"
+          USR=$(docker image inspect "$IMG" --format '{{.Config.User}}'); echo "user = ${USR}"
+          [ "$USR" = "1000:1000" ] || fail "image USER 為 ${USR}，預期 1000:1000"
+          UID_=$(docker run --rm --entrypoint id "$IMG" -u | tr -d '[:space:]'); echo "uid = ${UID_}"
+          [ "$UID_" = "1000" ] || fail "容器預設 uid 為 ${UID_}，預期 1000（非 root）"
+          EP=$(docker image inspect "$IMG" --format '{{json .Config.Entrypoint}}|{{json .Config.Cmd}}'); echo "entrypoint|cmd = ${EP}"
+          case "$EP" in
+            '["/sbin/tini","-g","--","/entrypoint.sh"]|null' | '["/sbin/tini","-g","--","/entrypoint.sh"]|[]') ;;
+            *) fail "ENTRYPOINT／CMD 不符（不可再帶上游的 containerboot）：${EP}" ;;
+          esac
+          V=$(docker run --rm --entrypoint tailscale "$IMG" version | head -n1); echo "tailscale = ${V}"
+          [ "$V" = "${TAILSCALE_VERSION}" ] || fail "tailscale 版本 ${V}，預期 ${TAILSCALE_VERSION}"
+          docker run --rm --entrypoint sh "$IMG" -c 'command -v bash jq tini tailscaled >/dev/null && test "$WOOW_TS_MODE" = k8s && test "$(stat -c %u /var/lib/tailscale)" = 1000 && test "$(stat -c %u /var/run/tailscale)" = 1000' \
+            || fail "缺 bash／jq／tini，或 WOOW_TS_MODE 預設不是 k8s，或 state／socket 目錄不屬於 uid 1000"
+          # 1) entrypoint 的 k8s 驗證函式單元測試（serve 清單、login server、hostname、tags、web listen）
+          docker run --rm -i --entrypoint bash -e ENTRYPOINT_SH=/entrypoint.sh "$IMG" -s < tailscale/tests/test-entrypoint.sh \
+            || fail "entrypoint 單元測試失敗"
+          # 2) 實際起來：唯讀根目錄、非 root、k8s 模式。login server 指到不存在的位址，不碰任何外部
+          #    控制平面；同時塞進會被忽略的 podman 旋鈕（exit node／passthrough），確認不生效。
+          docker volume rm -f ts-verify-state >/dev/null 2>&1 || true
+          docker volume create ts-verify-state >/dev/null
+          docker run -d --name "$C" --read-only \
+            --tmpfs /tmp:mode=1777 --tmpfs /var/run/tailscale:mode=1777 \
+            -v ts-verify-state:/var/lib/tailscale \
+            -e TS_LOGIN_SERVER=http://127.0.0.1:9 \
+            -e TS_HOSTNAME_DEFAULT=woow-verify -e POD_NAMESPACE=verify-ns \
+            -e 'TS_SERVE=8069=odoo:8069,9000=10.43.0.1:443,9001=svc.other-ns:80' \
+            -e TS_ADVERTISE_EXIT_NODE=true -e TS_ADVERTISE_ROUTES=10.0.0.0/8 \
+            -e 'TS_EXTRA_UP_ARGS=--advertise-exit-node' -e 'TS_EXTRA_TAILSCALED_ARGS=--socks5-server=0.0.0.0:1080' \
+            -e TS_WEB_UI=true -e TS_WEB_LISTEN=127.0.0.2:8088 \
+            "$IMG" >/dev/null
+          for _ in $(seq 1 30); do
+            docker exec "$C" tailscale status --json >/dev/null 2>&1 && break; sleep 1
+          done
+          docker exec "$C" tailscale status --json >/dev/null 2>&1 || fail "tailscaled 沒起來（status --json 失敗）"
+          sleep 5
+          docker exec "$C" sh -c 'ps -o user,args | grep "[t]ailscaled "' | tee /tmp/ts-ps.txt
+          grep -q -- '--tun=userspace-networking' /tmp/ts-ps.txt || fail "tailscaled 沒有用 userspace networking"
+          grep -q -- '--no-logs-no-support' /tmp/ts-ps.txt || fail "tailscaled 沒有帶 --no-logs-no-support"
+          grep -q -- 'socks5' /tmp/ts-ps.txt && fail "TS_EXTRA_TAILSCALED_ARGS 在 k8s 模式竟然生效"
+          awk '{print $1}' /tmp/ts-ps.txt | grep -qx root && fail "tailscaled 以 root 執行"
+          PREFS=$(docker exec "$C" tailscale debug prefs)
+          echo "$PREFS" | jq -c '{ControlURL, Hostname, AdvertiseRoutes, AppConnector, RunSSH, RunWebClient, ExitNodeID, CorpDNS, RouteAll}'
+          [ "$(echo "$PREFS" | jq -r '.AdvertiseRoutes // [] | length')" = "0" ] || fail "AdvertiseRoutes 不是空的（exit node／subnet route 沒被強制關）"
+          [ "$(echo "$PREFS" | jq -r '.AppConnector.Advertise // false')" = "false" ] || fail "app connector 沒被強制關"
+          [ "$(echo "$PREFS" | jq -r '.RunSSH')" = "false" ] || fail "Tailscale SSH 沒被強制關"
+          [ "$(echo "$PREFS" | jq -r '.RunWebClient')" = "false" ] || fail "tailnet 端管理 web client（:5252）被打開了"
+          [ "$(echo "$PREFS" | jq -r '.Hostname')" = "woow-verify" ] || fail "hostname 沒有採用 TS_HOSTNAME_DEFAULT"
+          [ "$(echo "$PREFS" | jq -r '.ControlURL')" = "http://127.0.0.1:9" ] || fail "login server 沒有生效"
+          docker exec "$C" wget -qO- http://127.0.0.2:8088/ | grep -qi '<html' || fail "tailscale web 沒有在 127.0.0.2:8088 回應"
+          docker exec "$C" wget -qO- -T 3 http://127.0.0.1:8088/ >/dev/null 2>&1 && fail "tailscale web 竟然在 127.0.0.1 上（netstack 會把 tailnet 連線送到 127.0.0.1）"
+          LOGS=$(docker logs "$C" 2>&1)
+          echo "$LOGS" | grep -q 'k8s mode: ignoring TS_ADVERTISE_EXIT_NODE TS_ADVERTISE_ROUTES TS_EXTRA_UP_ARGS TS_EXTRA_TAILSCALED_ARGS' || fail "沒有記錄被忽略的 podman 旋鈕"
+          echo "$LOGS" | grep -q "serve: skipping '9000=10.43.0.1:443'" || fail "serve：IP 目標沒有被略過"
+          echo "$LOGS" | grep -q "serve: skipping '9001=svc.other-ns:80'" || fail "serve：別的 namespace 沒有被略過"
+          echo "$LOGS" | grep -q 'serve: forwards wanted: 8069=odoo.verify-ns.svc.cluster.local:8069' || fail "serve：合法項目沒有被接受"
+          # 3) 重啟後 state 仍在（同一顆 volume；節點身分＝這個目錄）
+          docker exec "$C" sh -c 'test -s /var/lib/tailscale/tailscaled.state' || fail "state 沒有寫到 /var/lib/tailscale"
+          docker stop -t 10 "$C" >/dev/null
+          docker rm -f "$C" >/dev/null; docker volume rm -f ts-verify-state >/dev/null
+          echo "[verify] OK：amd64、uid 1000、tailscale ${TAILSCALE_VERSION}、tini→entrypoint（無 containerboot）、單元測試、唯讀根目錄起得來、userspace＋no-logs、exit node／connector／routes／SSH／web client 強制關、passthrough 被忽略、web 只在 127.0.0.2、serve 清單只收同 namespace。"
+      - name: Push candidate tag (pending approval)
+        if: github.event_name != 'issue_comment'
+        run: |
+          docker push "${JCR_INTERNAL}/${IMAGE_NAME}:${CANDIDATE_TAG}" | tee /tmp/push-candidate.log
+
+      # ── Prod build 人工核可 gate（兩段式，Refs #66、#68）──
+      # tailscale 為使用者 cloud service 用的 prod image，平台會 pin 其 digest，
+      # 故比照 open-design / woowtech-ha / cloud-odoo 無條件啟用 gate（無 stg 路徑可跳過）。
+      #
+      # 舊版（wait-for-approval.sh）在這裡整個 job 停留 in_progress、每 30 秒
+      # poll 一次，最長佔住唯一的 act-runner slot 180 分鐘。現在改成：本 step
+      # 開完 approval issue 就結束，job 隨即完成、runner 立即釋放；核可者留言
+      # /approve 由 issue_comment 事件觸發**全新的一次 run**，見下面
+      # 「Recover approval context from comment」。
+      - name: Open prod approval issue and stop
+        if: github.event_name != 'issue_comment'
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_HOST: gitea-http.gitea.svc.cluster.local:3000
+          GITEA_REPO: woow-paas/paas-odoo-ci
+          APPROVERS: ${{ vars.PROD_APPROVERS }}
+          BUILD_TAG: ${{ env.IMAGE_TAG }}
+          BUILD_IMAGE: ${{ env.IMAGE_NAME }}
+          TAG_PUSHER: ${{ github.actor }}
+          RUN_URL: https://git-prod.woowtech.io/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TIMEOUT_MIN: "180"
+          ALLOW_SELF_APPROVE: ${{ vars.ALLOW_SELF_APPROVE || 'false' }}
+          WORKFLOW_MARKER: ${{ env.WORKFLOW_MARKER }}
+          APPROVAL_SEAL_KEY: ${{ secrets.CI_GITEA_TOKEN }}
+        run: bash scripts/open-approval-issue.sh
+
+      # 這是「Open prod approval issue and stop」開的 issue，核可者留言後
+      # 觸發的新 run。三條授權邏輯（白名單／self-approve／精確比對）與逾時、
+      # ISSUE_AUTHOR 偽造防護都在 validate-approval-comment.sh 裡，見該檔頂端註解。
+      - name: Recover approval context from comment
+        if: github.event_name == 'issue_comment'
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_HOST: gitea-http.gitea.svc.cluster.local:3000
+          GITEA_REPO: woow-paas/paas-odoo-ci
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          APPROVERS: ${{ vars.PROD_APPROVERS }}
+          ALLOW_SELF_APPROVE: ${{ vars.ALLOW_SELF_APPROVE || 'false' }}
+          WORKFLOW_MARKER: ${{ env.WORKFLOW_MARKER }}
+          APPROVAL_SEAL_KEY: ${{ secrets.CI_GITEA_TOKEN }}
+        run: bash scripts/validate-approval-comment.sh
+
+      # act-runner 的 ubuntu-latest image 不保證預裝 skopeo（同 mirror-image.yml／
+      # haos／woowtech-ha-full 的三段式取得）。只有核可放行（要 promote）才需要，
+      # 故不在 phase 1 跑，省一次不必要的 apt/network 呼叫。
+      - name: Ensure skopeo
+        if: env.SHOULD_BUILD == 'true'
+        run: |
+          set -euo pipefail
+          if command -v skopeo >/dev/null 2>&1; then
+            SKOPEO_CMD="skopeo"
+          elif (sudo -n true 2>/dev/null && sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends skopeo) \
+            || (apt-get update -qq && apt-get install -y -qq --no-install-recommends skopeo); then
+            SKOPEO_CMD="skopeo"
+          elif docker pull -q quay.io/skopeo/stable:latest >/dev/null 2>&1; then
+            SKOPEO_CMD="docker run --rm --network host quay.io/skopeo/stable:latest"
+          else
+            echo "::error::runner 上取不到 skopeo（未預裝、apt 裝不起來、官方 container 也拉不到）"
+            exit 1
+          fi
+          $SKOPEO_CMD --version
+          echo "SKOPEO=${SKOPEO_CMD}" >> "$GITHUB_ENV"
+
+      # ── 核可放行：registry 端把候選 tag retag 成正式 tag（不重新 build）──
+      # tailscale 刻意不推 :latest（平台一律 pin digest；同 haos／woowtech-ha-full）。
+      - name: Promote candidate tag on approval
+        if: env.SHOULD_BUILD == 'true'
+        env:
+          JCR_USERNAME: ${{ secrets.JCR_USERNAME }}
+          JCR_PASSWORD: ${{ secrets.JCR_PASSWORD }}
+          PUSH_LATEST: "false"
+        run: bash scripts/promote-candidate-tag.sh
+
+      # ── 駁回：清掉候選 tag，不留垃圾 ──
+      # 只在真正 /reject 時觸發，判準用 validate-approval-comment.sh 明確寫出
+      # 的 env.SHOULD_CLEANUP（見該檔）。
+      #
+      # ⚠ 2026-08-08（PR #97 review，paas-platform 抓到）：原本判準是
+      # 「env.IMAGE_TAG != '' && env.SHOULD_BUILD != 'true'」，但 IMAGE_TAG
+      # 在核可者留任何非精確 /approve /reject 的話（打錯字、閒聊）時也會被
+      # 寫入——這種「看不懂、略過」的情況下上面那條件一樣成立，會誤刪一個
+      # 核可者根本沒打算駁回的候選 tag。SHOULD_CLEANUP 只在 case dispatch 的
+      # /reject 分支才寫，不會被其他分支誤觸發。
+      - name: Cleanup candidate tag on reject
+        if: always() && github.event_name == 'issue_comment' && env.SHOULD_CLEANUP == 'true'
+        env:
+          JCR_USERNAME: ${{ secrets.JCR_USERNAME }}
+          JCR_PASSWORD: ${{ secrets.JCR_PASSWORD }}
+        run: bash scripts/cleanup-candidate-tag.sh
+
+      # ── 印出 digest 與 image 大小（供平台 pin 與回報）──
+      # phase 2 的 runner 本地 docker daemon 沒有這顆 image（只在 phase 1 build
+      # 過），digest／size 改讀 promote-candidate-tag.sh 寫回的 $GITHUB_ENV，
+      # 不再用 docker image inspect／docker manifest inspect。
+      - name: Report digest and size
+        if: ${{ always() && env.SHOULD_BUILD == 'true' }}
+        run: |
+          echo "================ TAILSCALE IMAGE DIGEST ================"
+          echo "IMAGE_COORD=jcr-prod.woowtech.io/${IMAGE_NAME}:${IMAGE_TAG}@${IMAGE_DIGEST}"
+          echo "IMAGE_SIZE_BYTES=${IMAGE_SIZE_BYTES}"
+          echo "==========================================================="
+          echo "::notice title=tailscale digest::jcr-prod.woowtech.io/${IMAGE_NAME}:${IMAGE_TAG}@${IMAGE_DIGEST} (size=${IMAGE_SIZE_BYTES} bytes)"

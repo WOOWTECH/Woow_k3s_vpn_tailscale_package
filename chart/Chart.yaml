@@ -1,0 +1,67 @@
+apiVersion: v2
+name: tailscale
+description: |
+  「VPN 節點（相容 Tailscale）」cloud service chart — one Tailscale node per release.
+
+  Product scope (PLAN §8 Q2/Q3): a WORKSPACE-PRIVATE ENTRANCE. The node joins the
+  tenant's own tailnet (official Tailscale control plane, or any Headscale — for a
+  Headscale in the same workspace, its in-cluster URL) and publishes chosen
+  Services of the SAME namespace to that tailnet as TCP forwards (`tailscale serve`).
+  Exit node and app connector are forced off (the cluster's single public IP is
+  shared with the platform); subnet routes, Tailscale SSH, Funnel, Taildrop and the
+  SOCKS5 / HTTP proxies are not offered.
+
+  Pod: tailscaled in userspace mode (no NET_ADMIN, no /dev/net/tun, non-root
+  uid 1000), node identity on a 1 Gi RWO PVC (StatefulSet, one replica — two
+  tailscaleds on one state flap). `tailscale web` (read-only mode: Log in /
+  re-authenticate, no tailnet-side management client) on 127.0.0.2:8088 behind an
+  in-pod nginx that owns the ONLY entrance port (8080) with basic auth — the
+  platform credential: user entrance.basicAuthUsername (default admin) and
+  config.sensitive.admin_password (has_admin_gui, helm_secret carrier, username +
+  password self-set like headscale). The htpasswd is a Secret volume, so the pod
+  template never depends on either; the StatefulSet opts in to the operator's
+  restart on credential reset (paas.woowtech.io/restart-on-credential-reset) so
+  the platform's reset has a workload to roll (the node identity is on the PVC:
+  back on the tailnet as the same node within tens of seconds).
+
+  Image: jcr-prod tailscale, built by paas-odoo-ci `tailscale/` (derived from
+  WOOWTECH/Woow_podman_vpn_tailscale_package @ 4d4a735; entrypoint k8s mode).
+  Every tenant value (login server, hostname, tags, serve list, authkey) is passed
+  as env / a file and validated at RUN time by the entrypoint — a bad value is
+  skipped and logged, never a failed render.
+  Deployed per-tenant by paas-operator as svc-{ref[:8]} into a paas-ws-* namespace.
+type: application
+# 0.1.0 = first PaaS cut (2026-10-04): Tailscale 1.102.5, StatefulSet + chart-owned
+#         state PVC, nginx basic-auth entrance (Secret-volume htpasswd), run-time
+#         validated serve forwards, egress = DNS + same namespace + public internet
+#         minus private / CGNAT ranges. Verified in dev-sandbox against Headscale
+#         0.29.4 only (no official Tailscale account was used).
+# 0.1.1 = (2026-10-04, prod .207 defects) (1) the StatefulSet carries
+#         paas.woowtech.io/restart-on-credential-reset: "true": the platform's
+#         admin-credential reset (operator helm_secret path) treated "no Deployment"
+#         as a failure → helm rollback → 500 on every reset; with the matching
+#         paas-operator (woow_paas_platform #1398) this StatefulSet is restarted
+#         instead (inert with an older operator). (2) the basic-auth username is
+#         entrance.basicAuthUsername (default admin, like charts/headscale) so the
+#         platform can show it in the one-time credentials window
+#         (admin_username_helm_path) — it used to be a hard-coded `admin` the
+#         platform knew nothing about ("no username" while login needed admin).
+#         An invalid username never fails the render: it falls back to admin and
+#         the entrance logs why at start. Pod template still byte-identical across
+#         username / password changes. (3) liveness watchdog for plain-http control
+#         servers: after a Headscale restart tailscaled kept redialing :443 only
+#         ("forcing port 443 dial due to recent noise dial") and stayed offline for
+#         good; now tailscaled's "Out of sync" warning (8 min without a map poll)
+#         fails liveness → container restart → back online (~11 min worst case).
+version: 0.1.1
+appVersion: "1.102.5"
+kubeVersion: ">=1.24.0-0"
+keywords: [paas, tailscale, headscale, vpn, wireguard, cloud-service]
+maintainers:
+  - name: WOOW PaaS Team
+home: https://git-prod.woowtech.io/woow-paas/woow-paas-charts
+sources:
+  - https://git-prod.woowtech.io/woow-paas/woow-paas-charts
+  - https://git-prod.woowtech.io/woow-paas/paas-odoo-ci
+  - https://github.com/WOOWTECH/Woow_podman_vpn_tailscale_package
+  - https://github.com/tailscale/tailscale

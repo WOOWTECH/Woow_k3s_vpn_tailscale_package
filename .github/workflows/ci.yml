@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    name: Lint and render the mirrored chart
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: azure/setup-helm@b9e51907a09c216f16ebe8536097933489208112 # v4.3.0
+        with:
+          version: v3.19.5
+      - name: Install yq (mikefarah)
+        run: |
+          set -Eeuo pipefail
+          sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.53.6/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+      - name: helm lint
+        run: helm lint chart
+      - name: Chart tests (helm template render contract)
+        run: |
+          set -Eeuo pipefail
+          for t in chart/tests/*.sh; do echo "== $t"; bash "$t"; done
+
+  # The entrypoint's k8s-mode validators (serve list, login server, hostname, tags,
+  # web listen) are plain bash and need no container runtime.
+  entrypoint:
+    name: Entrypoint unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: test-entrypoint.sh
+        run: bash image/tests/test-entrypoint.sh
+
+  sync-script:
+    name: Sync script check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Syntax and shellcheck
+        run: |
+          set -Eeuo pipefail
+          test -x scripts/sync-from-gitea.sh || { echo "scripts/sync-from-gitea.sh is not executable"; exit 1; }
+          bash -n scripts/sync-from-gitea.sh
+          shellcheck --version | head -2
+          shellcheck scripts/sync-from-gitea.sh
+      - name: Source paths match the mirror layout
+        run: |
+          set -Eeuo pipefail
+          s=scripts/sync-from-gitea.sh; found=0
+          grep -qF '"$WORK/charts/charts/tailscale" "$ROOT/chart"' "$s" || { echo "sync script no longer copies charts/tailscale to chart/"; found=1; }
+          grep -qF '"$WORK/ci/tailscale" "$ROOT/image"' "$s" || { echo "sync script no longer copies tailscale/ to image/"; found=1; }
+          grep -qF 'WORKFLOW=".gitea/workflows/build-tailscale-image.yml"' "$s" || { echo "sync script no longer copies the build workflow"; found=1; }
+          exit $found
+
+  # The image is built, verified and published by woow-paas/paas-odoo-ci behind a
+  # prod approval gate. Nothing here builds or pushes it; this job only checks that
+  # the mirror is complete and internally consistent.
+  mirror-guard:
+    name: Mirror completeness
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check the mirror layout
+        run: |
+          set -Eeuo pipefail
+          found=0
+          for f in chart/Chart.yaml chart/values.yaml chart/tests/test-render-contract.sh \
+                   image/Dockerfile image/entrypoint.sh image/README.md image/tests/test-entrypoint.sh \
+                   image/ci/build-tailscale-image.yml \
+                   MIRROR.md README.md README_zh-TW.md scripts/sync-from-gitea.sh; do
+            [ -e "$f" ] || { echo "MISSING: $f"; found=1; }
+          done
+          # GitHub must never run the Gitea build pipeline: ci.yml is the only workflow here.
+          others="$(find .github/workflows -type f ! -name ci.yml)"
+          [ -z "$others" ] || { echo "unexpected workflows (this mirror builds nothing): $others"; found=1; }
+          grep -q '<!-- BEGIN GENERATED' MIRROR.md || { echo "MIRROR.md lost its generated block"; found=1; }
+          # the image pins the official Tailscale image by tag AND digest, at the chart's appVersion
+          app="$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/p' chart/Chart.yaml)"
+          base="$(sed -n 's/^ARG BASE=//p' image/Dockerfile)"
+          echo "appVersion=${app}  base=${base}"
+          printf '%s' "$base" | grep -qE "^docker\.io/tailscale/tailscale:v${app//./\\.}@sha256:[0-9a-f]{64}$" \
+            || { echo "image/Dockerfile base is not tailscale/tailscale:v${app}@sha256:<digest>"; found=1; }
+          grep -qE "^  TAILSCALE_VERSION: \"${app//./\\.}\"$" image/ci/build-tailscale-image.yml \
+            || { echo "build workflow TAILSCALE_VERSION differs from chart appVersion ${app}"; found=1; }
+          grep -q 'woow-paas-docker-local/tailscale' chart/values.yaml || { echo "chart image repository changed"; found=1; }
+          # the generated block must name the same base digest as image/Dockerfile
+          grep -qF "$base" MIRROR.md || { echo "MIRROR.md base image is stale (rerun scripts/sync-from-gitea.sh)"; found=1; }
+          # the hand-kept production pin must be the same in MIRROR.md and both READMEs
+          pin_re='jcr-prod\.woowtech\.io/woow-paas-docker-local/tailscale:[0-9]{8}\.[0-9]{4}@sha256:[0-9a-f]{64}'
+          pins="$(grep -ohE "$pin_re" MIRROR.md README.md README_zh-TW.md | sort -u)"
+          echo "production pin(s): ${pins:-<none>}"
+          [ "$(printf '%s\n' "$pins" | grep -c .)" = "1" ] || { echo "MIRROR.md / README.md / README_zh-TW.md disagree on the production image pin"; found=1; }
+          exit $found

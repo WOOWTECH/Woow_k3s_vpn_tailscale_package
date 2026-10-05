@@ -1,0 +1,17 @@
+VPN 節點（相容 Tailscale）{{ .Chart.AppVersion }} — release {{ .Release.Name }} in {{ .Release.Namespace }}
+
+Web UI (platform tunnel target, ClusterIP {{ include "tailscale.fullname" . }}:{{ .Values.service.port }}; basic auth, user {{ include "tailscale.basicAuthUsername" . }}).
+  `kubectl port-forward` is refused (403) by design: it arrives on the pod's loopback,
+  which nginx denies because tailnet traffic to the node also lands there. Use a pod in
+  the namespace, or check the node directly:
+  kubectl -n {{ .Release.Namespace }} exec {{ include "tailscale.fullname" . }}-0 -c tailscale -- tailscale status
+
+Control server: {{ .Values.tailscale.loginServer | default "official Tailscale (controlplane.tailscale.com)" }}
+Login: {{ if .Values.tailscale.authKey }}auth key set (used only while the node needs a login — clear it afterwards){{ else }}open the web UI → Log in, or read the URL from the log:
+  kubectl -n {{ .Release.Namespace }} logs {{ include "tailscale.fullname" . }}-0 -c tailscale | grep -A1 'To authenticate'{{ end }}
+Tailnet name: {{ .Values.tailscale.hostname | default (include "tailscale.defaultHostname" .) }}
+Forwards (validated at run time; skipped entries are logged): {{ .Values.tailscale.serve | default "none" }}
+  kubectl -n {{ .Release.Namespace }} logs {{ include "tailscale.fullname" . }}-0 -c tailscale | grep 'serve:'
+
+Exit node, app connector and subnet routes are forced off; Tailscale SSH, Funnel,
+Taildrop and the SOCKS5 / HTTP proxies are not offered.

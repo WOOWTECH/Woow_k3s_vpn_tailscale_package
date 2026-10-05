@@ -1,0 +1,169 @@
+# ── Image (platform helm_default_values pins tag@sha256) ──────────────────────
+# paas-odoo-ci `tailscale/` (official tailscale/tailscale 1.102.5 + the WOOW
+# entrypoint derived from the podman package; non-root uid 1000). The platform
+# writes tag "<YYYYMMDD.HHMM>@sha256:<digest>"; `digest` is an alternative pin
+# (appended when the tag carries none).
+image:
+  repository: jcr-prod.woowtech.io/woow-paas-docker-local/tailscale
+  tag: ""             # "" → .Chart.AppVersion (platform always overrides with a digest pin)
+  digest: ""
+  pullPolicy: IfNotPresent
+# operator forwards the tenant-ns pull secret as this TOP-LEVEL list of dicts
+# (paas-operator releases.py _ensure_image_pull_secrets). global.imagePullSecrets
+# (strings or dicts) is merged in too.
+imagePullSecrets:
+  - name: paas-registry
+global:
+  imagePullSecrets: []
+
+# Pinned to 1 and NOT a tenant knob: the node identity is the state on one RWO
+# PVC, and two tailscaleds sharing a state flap their node key.
+replicaCount: 1
+timezone: Asia/Taipei
+
+# ── The node (tenant knobs = helm_value_specs; all validated at RUN time) ──────
+tailscale:
+  # Control server. "" = official Tailscale (controlplane.tailscale.com); else an
+  # http(s) URL — a Headscale, e.g. the same-workspace one's in-cluster URL
+  # http://svc-xxxxxxxx-headscale:8080. Changing it logs the node out and
+  # registers it again (new node identity and tailnet IP). A malformed URL is
+  # logged and leaves the node's current login untouched.
+  loginServer: ""
+  # The TENANT's auth key (Tailscale tskey-auth-… or a Headscale pre-auth key),
+  # entered on the service page as a password-type field (masked in every API
+  # response). It lives HERE, never under config.sensitive — the platform strips
+  # that whole subtree from tenant input (EMQX 0.1.1 lesson). Used only while the
+  # node needs a login; a logged-in node never reads it. Recommend one-off,
+  # pre-approved, tagged keys and clearing the field after the first login.
+  authKey: ""
+  # Name on the tailnet (one DNS label). "" or invalid → woow-<release>.
+  hostname: ""
+  # Advertised tags, CSV of tag:<name> (invalid ones are skipped). Take effect at
+  # login; changing them on a logged-in node may require a re-login.
+  tags: ""
+  # TCP forwards: "<tailnet port>=<service>:<port>,…", e.g.
+  # "8069=svc-1a2b3c4d-woow-odoo:8069,8123=svc-5e6f7a8b-home-assistant:8123".
+  # Only Services of THIS namespace; IPs, outside names and other namespaces are
+  # skipped and logged by the entrypoint (never a failed render).
+  serve: ""
+  # tailscaled --no-logs-no-support (no log upload to log.tailscale.io).
+  noLogs: true
+  # Fixed — not tenant knobs.
+  udpPort: 41641
+  serveSyncSeconds: 15
+  clusterDomain: cluster.local
+  # `tailscale web` listen address: a 127.x address that is NOT 127.0.0.1 (in
+  # userspace mode tailnet traffic to an unserved port of the node lands on
+  # 127.0.0.1:<port>). Only the nginx entrance below reaches it.
+  webListen: "127.0.0.2:8088"
+  # Plan overlay target: the platform writes the plan's cs_vcpu / cs_ram_gb into
+  # the TOP-LEVEL `resources`, deep-merged over this. Measured in dev-sandbox
+  # (idle, logged in, 2 forwards): see README / PR.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+# ── Plan overlay (platform-written, #332) ─────────────────────────────────────
+# ⚠ The platform's lane: CloudService._apply_plan_spec_overlay writes
+# requests = limits = the plan's cs_vcpu / cs_ram_gb here; the chart applies it
+# to the tailscale container. Empty = the chart's own defaults.
+resources: {}
+
+# ── Tenant credential (platform has_admin_gui supply chain) ───────────────────
+config:
+  sensitive:
+    # nginx basic-auth password (user entrance.basicAuthUsername). "" → generated
+    # once and kept across upgrades via `lookup`. The platform pins it via
+    # sensitive_values; reset = helm upgrade (helm_secret carrier, only the Secret
+    # changes — the pod template never depends on the password) followed by the
+    # operator's rollout restart of this StatefulSet (opt-in label). The htpasswd
+    # is a Secret VOLUME and nginx re-reads it per request, so even a plain
+    # `helm upgrade` lands without a restart.
+    admin_password: ""
+
+# ── Entrance (nginx; the tunnel target) ───────────────────────────────────────
+entrance:
+  port: 8080            # template default_port; the operator picks 8080
+  # Basic-auth username (CloudAppTemplate admin_username_helm_path points here, so
+  # the platform shows it in the one-time credentials window and lets the tenant
+  # change it in Admin Credentials). Same rule as charts/headscale and the
+  # platform's TENANT_ADMIN_USERNAME_RE: 1–64 of A-Z a-z 0-9 . _ @ - (it is written
+  # verbatim into the htpasswd line, which nginx splits at the first ':'). Anything
+  # else never fails the render: basic auth falls back to `admin` and the entrance
+  # container logs the reason when it starts. Lives only in the Secret — changing
+  # it never changes the pod template.
+  basicAuthUsername: admin
+  image:
+    # Same digest the emqx / pi-agent / open-design / hermes entrances run.
+    repository: docker.io/nginxinc/nginx-unprivileged
+    tag: "1.27-alpine@sha256:65e3e85dbaed8ba248841d9d58a899b6197106c23cb0ff1a132b7bfe0547e4c0"
+    pullPolicy: IfNotPresent
+  # `auto` forks one worker per HOST cpu (not cgroup-aware) — pin it.
+  workerProcesses: 1
+  workerConnections: 256
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 200m
+      memory: 64Mi
+
+# ── Service (ClusterIP-only; the un-suffixed fullname is the tunnel target) ───
+service:
+  type: ClusterIP
+  port: 8080
+
+# ── Persistence (node identity) ───────────────────────────────────────────────
+persistence:
+  enabled: true
+  storageClass: ""     # platform-injected (flat key); "" = cluster default
+  # The plan's cs_storage_gb lands here (platform overlay); "" → defaultSize.
+  size: ""
+  defaultSize: 1Gi
+  accessModes: [ReadWriteOnce]
+  existingClaim: ""
+
+# ── NetworkPolicy (default-deny + explicit allow) ─────────────────────────────
+# Egress is the ONLY guard on what the tailnet can reach through this node
+# (userspace forwards originate from this pod): DNS, this namespace (serve
+# targets, a same-workspace Headscale), and the public internet on any port /
+# protocol (control plane, DERP 443, STUN 3478/udp, peers' WireGuard ports)
+# minus every private / link-local / CGNAT range — the cluster (10.42/16 pods,
+# 10.43/16 Services), the node LAN, the apiserver and the nodes' own tailnet
+# (100.64/10). Not a tenant knob, no allow-all switch.
+networkPolicy:
+  enabled: true
+
+# ── Pod hardening ─────────────────────────────────────────────────────────────
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+terminationGracePeriodSeconds: 30
+serviceAccount:
+  create: true
+  name: ""
+  automountToken: false   # nothing in this pod talks to the K8s API
+nodeSelector:
+  kubernetes.io/arch: amd64
+affinity: {}
+tolerations: []
+podLabels: {}
+podAnnotations: {}
+nameOverride: ""
+fullnameOverride: ""

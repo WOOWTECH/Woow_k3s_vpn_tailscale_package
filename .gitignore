@@ -1,0 +1,27 @@
+# Real secrets must never be committed.
+# Patterns are anchored to the repo root (leading /) on purpose: an unanchored
+# "secret.yaml" would also match chart/templates/secret.yaml and keep the
+# chart's own Secret template out of git.
+/.env
+/.env.*
+/*.env
+/credentials.json
+/*credentials.json
+/secrets.yaml
+/*-secrets.yaml
+/*.secret.yaml
+/*secrets.values.yaml
+/*.local.yaml
+/*.key
+/*.pem
+/kubeconfig
+/kubeconfig.*
+
+# Never ignore anything inside the mirrored sources.
+!/chart/**
+!/image/**
+
+# Packaged charts
+/*.tgz
+chart/charts/
+.DS_Store

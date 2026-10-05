@@ -1,0 +1,12 @@
+# Patterns to ignore when building packages.
+.DS_Store
+.git/
+.gitignore
+*.tmp
+*.bak
+*.swp
+*.orig
+.idea/
+.vscode/
+# chart tests are dev-only assertions, not part of the runtime package
+tests/

@@ -1,0 +1,265 @@
+{{- $fullname := include "tailscale.fullname" . -}}
+{{- $sock := "/var/run/tailscale/tailscaled.sock" -}}
+{{- $probe := list "tailscale" (printf "--socket=%s" $sock) "status" "--json" "--peers=false" -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "tailscale.labels" . | nindent 4 }}
+    # Opt-in for the platform's admin-credential reset (operator helm_secret path,
+    # woow_paas_platform #1398): helm upgrade (only the Secret changes) → rollout
+    # restart of the release's Deployments AND of StatefulSets carrying this label.
+    # This chart has no Deployment, and an operator that finds nothing to restart
+    # rolls the reset back (prod .207: every reset failed). nginx would pick the
+    # new htpasswd up live anyway; the restart is what lets the reset complete
+    # (node identity is on the PVC — same node, back within tens of seconds).
+    # Only on THIS StatefulSet — never on the pod template.
+    paas.woowtech.io/restart-on-credential-reset: "true"
+spec:
+  # One node = one identity = one state. Not a tenant knob (values.yaml).
+  replicas: 1
+  serviceName: {{ include "tailscale.headlessServiceName" . }}
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "tailscale.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tailscale.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/entrance: {{ include (print $.Template.BasePath "/entrance-configmap.yaml") . | sha256sum }}
+        # The entrypoint reads the auth key at start (only while the node needs a
+        # login), so a new key restarts the pod. Deliberately NOT a checksum over the
+        # Secret: the password must never change the pod template (the operator's
+        # credential reset is `helm upgrade --atomic --timeout 15s`).
+        checksum/authkey: {{ include "tailscale.authKey" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with (include "tailscale.imagePullSecrets" .) }}
+      imagePullSecrets:
+        {{- . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "tailscale.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken }}
+      # No docker-link env for every Service of the workspace.
+      enableServiceLinks: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: tailscale
+          image: {{ include "tailscale.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # The image's ENTRYPOINT (tini → /entrypoint.sh) in k8s mode. Every tenant
+          # value below is plain env, validated by the entrypoint at run time and never
+          # interpolated into a shell — a bad value is skipped and logged.
+          env:
+            - name: WOOW_TS_MODE
+              value: "k8s"
+            - name: TZ
+              value: {{ .Values.timezone | quote }}
+            - name: HOME
+              value: /tmp
+            # A subdirectory of the PVC: tailscaled chmods its state dir to 0700, which
+            # only the owner may do — the volume root belongs to root (fsGroup only adds
+            # the group), the subdirectory is created by uid 1000.
+            - name: STATE_DIR
+              value: /var/lib/tailscale/state
+            - name: TS_SOCKET
+              value: {{ $sock | quote }}
+            - name: TS_UDP_PORT
+              value: {{ .Values.tailscale.udpPort | quote }}
+            - name: TS_LOGIN_SERVER
+              value: {{ .Values.tailscale.loginServer | default "" | toString | quote }}
+            - name: TS_HOSTNAME
+              value: {{ .Values.tailscale.hostname | default "" | toString | quote }}
+            - name: TS_HOSTNAME_DEFAULT
+              value: {{ include "tailscale.defaultHostname" . | quote }}
+            - name: TS_TAGS
+              value: {{ .Values.tailscale.tags | default "" | toString | quote }}
+            - name: TS_SERVE
+              value: {{ .Values.tailscale.serve | default "" | toString | quote }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: TS_CLUSTER_DOMAIN
+              value: {{ .Values.tailscale.clusterDomain | quote }}
+            - name: TS_SERVE_SYNC_SECONDS
+              value: {{ .Values.tailscale.serveSyncSeconds | quote }}
+            - name: TS_NO_LOGS_NO_SUPPORT
+              value: {{ .Values.tailscale.noLogs | ternary "true" "false" | quote }}
+            - name: TS_AUTHKEY_FILE
+              value: /etc/woow-tailscale/authkey/authkey
+            - name: TS_WEB_UI
+              value: "true"
+            - name: TS_WEB_LISTEN
+              value: {{ .Values.tailscale.webListen | quote }}
+          # Ready = tailscaled answers on its socket, logged in or not: `status --json`
+          # exits 0 in every backend state (plain `status` exits 1 while NeedsLogin,
+          # which would keep a fresh node "deploying" forever).
+          startupProbe:
+            exec:
+              command: {{ toJson $probe }}
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            exec:
+              command: {{ toJson $probe }}
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Liveness = tailscaled answers on its socket, AND — with a plain-http control
+          # server — is not stuck out of sync. Why: tailscaled redials control with
+          # Noise-over-TLS on port 443 ONLY while its previous dial is < 2 min old
+          # (controlhttp "forcing port 443 dial due to recent noise dial"), and for an
+          # http:// URL with a host NAME (http://<release>-headscale:8080) the fallback
+          # port is 443. After any Headscale restart (settings save, credential reset,
+          # upgrade) the first redial hits the restarting server, every retry (≤ 45 s
+          # apart) is "recent", and the node never dials :8080 again — offline until
+          # tailscaled restarts (measured in dev-sandbox 2026-10-04, tailscale 1.102.5;
+          # same code on upstream main). tailscaled's own "Out of sync" health warning
+          # appears after 8 min without a map poll; failing liveness on it restarts the
+          # tailscale container (identity on the PVC — same node), whose first dial uses
+          # :8080 again. https / official control servers dial :443 anyway → never
+          # restarted for this. Static script: the URL is only matched, never expanded.
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  s="$(tailscale --socket={{ $sock }} status --json --peers=false)" || exit 1
+                  case "$TS_LOGIN_SERVER" in
+                    [Hh][Tt][Tt][Pp]://*)
+                      case "$s" in
+                        *"Unable to connect to the Tailscale coordination server"*)
+                          echo "control server unreachable for 8+ min (http:// login server): restarting tailscaled"
+                          exit 1 ;;
+                      esac ;;
+                  esac
+                  exit 0
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/tailscale
+            - name: run
+              mountPath: /var/run/tailscale
+            - name: tmp
+              mountPath: /tmp
+            - name: authkey
+              mountPath: /etc/woow-tailscale/authkey
+              readOnly: true
+          resources:
+            {{- include "tailscale.mainResources" . | nindent 12 }}
+        # The tunnel target: basic auth (platform credential) → `tailscale web`.
+        - name: entrance
+          image: "{{ .Values.entrance.image.repository }}:{{ .Values.entrance.image.tag }}"
+          imagePullPolicy: {{ .Values.entrance.image.pullPolicy }}
+          # The image's own entrypoint + CMD, preceded by one log line when the chart
+          # has something to report (Secret key entrance_notice, e.g. an invalid
+          # entrance.basicAuthUsername that fell back to admin). Static text: the
+          # notice is read from the Secret volume, never templated in here.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              notice="$(cat /etc/nginx/auth/notice 2>/dev/null || true)"
+              [ -z "$notice" ] || echo "woow-entrance: $notice" >&2
+              exec /docker-entrypoint.sh nginx -g 'daemon off;'
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.entrance.port }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: entrance-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            # Directory mount, NOT subPath (subPath never refreshes): a credential change
+            # swaps the file in place and nginx reads it on the next request.
+            - name: entrance-auth
+              mountPath: /etc/nginx/auth
+              readOnly: true
+            - name: entrance-tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.entrance.resources | nindent 12 }}
+      volumes:
+        - name: state
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "tailscale.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: run
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: authkey
+          secret:
+            secretName: {{ include "tailscale.secretName" . }}
+            defaultMode: 0400
+            optional: true
+            items:
+              - key: authkey
+                path: authkey
+        - name: entrance-conf
+          configMap:
+            name: {{ include "tailscale.entranceConfigMapName" . }}
+        - name: entrance-auth
+          secret:
+            secretName: {{ include "tailscale.secretName" . }}
+            defaultMode: 0444
+            items:
+              - key: htpasswd
+                path: .htpasswd
+              - key: entrance_notice
+                path: notice
+        - name: entrance-tmp
+          emptyDir:
+            sizeLimit: 16Mi

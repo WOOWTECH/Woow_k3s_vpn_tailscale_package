@@ -1,0 +1,39 @@
+{{/*
+Entrance Service: the un-suffixed fullname, ClusterIP, ONE port — the nginx entrance
+(8080, in the operator's preference list). It sorts before the headless Service,
+which the operator skips anyway. Nothing of tailscaled is published in-cluster.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tailscale.fullname" . }}
+  labels:
+    {{- include "tailscale.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "tailscale.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.service.port }}
+      targetPort: http
+---
+{{/* Headless Service: the StatefulSet's governing Service (never a tunnel target). */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tailscale.headlessServiceName" . }}
+  labels:
+    {{- include "tailscale.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "tailscale.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.entrance.port }}
+      targetPort: http
